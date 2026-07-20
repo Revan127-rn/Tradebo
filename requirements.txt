@@ -5,3 +5,4 @@ flask
 requests
 beautifulsoup4
 duckduckgo_search
+psycopg2-binary
