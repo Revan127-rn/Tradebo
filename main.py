@@ -9,12 +9,13 @@ import threading
 import time
 import re
 import sqlite3
+import requests
+from bs4 import BeautifulSoup
 from flask import Flask
 
 # --- KONFİQURASİYA VƏ ƏTRAF DƏYİŞƏNLƏRİ (ENV) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
 
 bot = telebot.TeleBot(BOT_TOKEN)
 client = Groq(api_key=GROQ_API_KEY)
@@ -22,6 +23,8 @@ client = Groq(api_key=GROQ_API_KEY)
 BAZA_FAYLI = "ict_knowledge.json"
 DB_FILE = "tradebo.db"
 LESSONS_FILE = "lessons_learned.txt"
+INITIAL_BALANCE = 10000.0  # Xəyali İlkin Balans ($)
+TRADE_STAKE = 50.0         # Hər əməliyyata sabit daxil olunan məbləğ ($)
 
 user_context = {}
 
@@ -30,16 +33,17 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🚀 Tradebo v2 Buludda 24/7 Aktivdir!"
+    return "🚀 Tradebo v3 Virtual Wallet & AI Research Server Aktivdir!"
 
 def run_flask():
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- SQLITE VERİLƏNLƏR BAZASI FUNKSİYALARI ---
+# --- SQLITE VERİLƏNLƏR BAZASI VƏ BALANS İDARƏSİ ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    # Əməliyyatlar Cədvəli
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS trades (
             id TEXT PRIMARY KEY,
@@ -52,9 +56,65 @@ def init_db():
             is_buy INTEGER,
             status TEXT,
             sebeb TEXT,
+            pnl REAL DEFAULT 0.0,
             ders_cixarildi INTEGER DEFAULT 0
         )
     ''')
+    # Balans və Mükafat Cədvəli
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS wallet (
+            id INTEGER PRIMARY KEY,
+            balance REAL,
+            total_profit REAL,
+            total_trades INTEGER,
+            wins INTEGER,
+            losses INTEGER
+        )
+    ''')
+    
+    cursor.execute("SELECT COUNT(*) FROM wallet")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute('''
+            INSERT INTO wallet (id, balance, total_profit, total_trades, wins, losses)
+            VALUES (1, ?, 0.0, 0, 0, 0)
+        ''', (INITIAL_BALANCE,))
+        
+    conn.commit()
+    conn.close()
+
+def get_wallet():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance, total_profit, total_trades, wins, losses FROM wallet WHERE id=1")
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {
+            "balance": row[0],
+            "total_profit": row[1],
+            "total_trades": row[2],
+            "wins": row[3],
+            "losses": row[4]
+        }
+    return {"balance": INITIAL_BALANCE, "total_profit": 0.0, "total_trades": 0, "wins": 0, "losses": 0}
+
+def update_wallet_on_trade_close(pnl):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    wallet = get_wallet()
+    
+    new_balance = wallet["balance"] + pnl
+    new_profit = wallet["total_profit"] + pnl
+    new_trades = wallet["total_trades"] + 1
+    new_wins = wallet["wins"] + (1 if pnl > 0 else 0)
+    new_losses = wallet["losses"] + (1 if pnl < 0 else 0)
+    
+    cursor.execute('''
+        UPDATE wallet 
+        SET balance=?, total_profit=?, total_trades=?, wins=?, losses=?
+        WHERE id=1
+    ''', (new_balance, new_profit, new_trades, new_wins, new_losses))
+    
     conn.commit()
     conn.close()
 
@@ -63,8 +123,8 @@ def save_trade_db(trade_data):
     cursor = conn.cursor()
     cursor.execute('''
         INSERT OR REPLACE INTO trades 
-        (id, symbol, trade_type, saat, entry_price, sl_price, tp_price, is_buy, status, sebeb, ders_cixarildi)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, symbol, trade_type, saat, entry_price, sl_price, tp_price, is_buy, status, sebeb, pnl, ders_cixarildi)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         str(trade_data["id"]),
         trade_data["symbol"],
@@ -76,6 +136,7 @@ def save_trade_db(trade_data):
         1 if trade_data["is_buy"] else 0,
         trade_data["status"],
         trade_data["sebeb"],
+        trade_data.get("pnl", 0.0),
         1 if trade_data.get("ders_cixarildi") else 0
     ))
     conn.commit()
@@ -104,10 +165,12 @@ def get_trades_db(trade_type=None):
             "is_buy": bool(r[7]),
             "status": r[8],
             "sebeb": r[9],
-            "ders_cixarildi": bool(r[10])
+            "pnl": r[10],
+            "ders_cixarildi": bool(r[11])
         })
     return result
 
+# --- PIPS VƏ MÜKAFAT KALKULYATORU ---
 def check_and_update_trades_db():
     trades = get_trades_db()
     conn = sqlite3.connect(DB_FILE)
@@ -117,32 +180,121 @@ def check_and_update_trades_db():
         if t["status"] == "Açıq":
             try:
                 ticker = yf.Ticker(t["symbol"])
-                current_price = ticker.history(period="1d", interval="1m")['Close'].iloc[-1]
+                df = ticker.history(period="1d", interval="1m")
+                if df.empty:
+                    continue
+                current_price = df['Close'].iloc[-1]
+                
+                entry = t["entry_price"]
+                sl = t["sl_price"]
+                tp = t["tp_price"]
+                is_buy = t["is_buy"]
                 
                 new_status = None
-                if t["is_buy"]:
-                    if current_price <= t["sl_price"]:
+                pnl = 0.0
+                
+                # $50 Sabit Məbləğlə Hesablama
+                if is_buy:
+                    if current_price <= sl:
                         new_status = "🔴 SL Oldu"
-                    elif current_price >= t["tp_price"]:
+                        ratio = (sl - entry) / entry
+                        pnl = TRADE_STAKE * ratio
+                    elif current_price >= tp:
                         new_status = "🟢 TP Oldu"
+                        ratio = (tp - entry) / entry
+                        pnl = TRADE_STAKE * ratio
                 else:
-                    if current_price >= t["sl_price"]:
+                    if current_price >= sl:
                         new_status = "🔴 SL Oldu"
-                    elif current_price <= t["tp_price"]:
+                        ratio = (entry - sl) / entry
+                        pnl = TRADE_STAKE * ratio
+                    elif current_price <= tp:
                         new_status = "🟢 TP Oldu"
+                        ratio = (entry - tp) / entry
+                        pnl = TRADE_STAKE * ratio
                         
                 if new_status:
-                    cursor.execute("UPDATE trades SET status=? WHERE id=?", (new_status, t["id"]))
-            except:
+                    cursor.execute("UPDATE trades SET status=?, pnl=? WHERE id=?", (new_status, round(pnl, 2), t["id"]))
+                    update_wallet_on_trade_close(round(pnl, 2))
+            except Exception as e:
+                print(f"Qiymət yeniləmə xətası: {e}")
                 continue
                 
     conn.commit()
     conn.close()
 
-# --- SMC VƏ MARKET DATA FUNKSİYALARI ---
-def bazadan_ağıllı_ict_sec(axtaris_sozleri, max_chunks=30):
+# --- JSON BAZASI İDARƏSİ VƏ ARAŞDIRMA SİSTEMİ ---
+def safe_clean_json():
+    """Strategiyaları silmədən json faylı təmizləyir va lazımsız dublikat/boş mətnləri kənarlaşdırır."""
     if not os.path.exists(BAZA_FAYLI):
-        return "Qeyd: Hələ heç bir strategiya PDF-i öyrənilməyib."
+        return
+    with open(BAZA_FAYLI, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except:
+            return
+
+    clean_data = []
+    seen = set()
+    for item in data:
+        text = item.strip()
+        # English studies və ya lazımsız akademik mətnləri süzgəcdən keçir
+        if "English Studies" in text or "ISSN " in text or "Bulgarian University" in text:
+            continue
+        if len(text) > 30 and text not in seen:
+            seen.add(text)
+            clean_data.append(text)
+
+    with open(BAZA_FAYLI, "w", encoding="utf-8") as f:
+        json.dump(clean_data, f, ensure_ascii=False, indent=2)
+
+def append_new_strategy_to_json(new_knowledge):
+    """Əsas strategiyanı silmədən internetdən öyrənilən yeni konsepsiyanı JSON-a əlavə edir."""
+    safe_clean_json()
+    if not os.path.exists(BAZA_FAYLI):
+        data = []
+    else:
+        with open(BAZA_FAYLI, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except:
+                data = []
+
+    if new_knowledge not in data:
+        data.append(new_knowledge)
+
+    with open(BAZA_FAYLI, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def web_research_smc_concept(topic):
+    """Google/Araşdırma mənbələrindən istifadə edərək AI vasitəsilə yeni strategiya öyrənir."""
+    try:
+        url = f"https://html.duckduckgo.com/html/?q=SMC+trading+{topic.replace(' ', '+')}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        req = requests.get(url, headers=headers, timeout=5)
+        soup = BeautifulSoup(req.text, 'html.parser')
+        results = [a.text for a in soup.find_all('a', class_='result__snippet')[:3]]
+        search_summary = "\n".join(results) if results else "Xüsusi nəticə tapılmadı."
+
+        prompt = f"""İnternet araşdırmasından SMC ({topic}) haqqında məlumatlar tapıldı:
+{search_summary}
+Bu məlumatı təhlil et və bota gələcəkdə istifadə etməsi üçün 3 cümləlik İNGİLİS dilində dəqiq SMC qaydası formalaşdır. Yalnız qaydanı qaytar."""
+
+        res = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile",
+            temperature=0.2
+        )
+        new_rule = res.choices[0].message.content.strip()
+        append_new_strategy_to_json(new_rule)
+        return new_rule
+    except Exception as e:
+        return f"Araşdırma zamanı xəta: {e}"
+
+def bazadan_ağıllı_ict_sec(axtaris_sozleri, max_chunks=30):
+    safe_clean_json()
+    if not os.path.exists(BAZA_FAYLI):
+        return "Qeyd: Hələ heç bir strategiya öyrənilməyib."
     with open(BAZA_FAYLI, "r", encoding="utf-8") as f:
         chunks = json.load(f)
     sozler = [s.lower() for s in axtaris_sozleri.split()]
@@ -189,11 +341,42 @@ def extract_json(text):
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     bot.set_my_commands([
-        telebot.types.BotCommand("/analiz", "Yeni paritə analizi et"),
-        telebot.types.BotCommand("/history", "Son 10 əməliyyata bax"),
-        telebot.types.BotCommand("/parite", "Paritə siyahısını gör"),
+        telebot.types.BotCommand("/analiz", "Paritə analizi et ($50 risk)"),
+        telebot.types.BotCommand("/balans", "Virtual portfel və mükafatlar"),
+        telebot.types.BotCommand("/history", "Son əməliyyat tarixçəsi"),
+        telebot.types.BotCommand("/arastir", "SMC konsepsiyası araşdır"),
+        telebot.types.BotCommand("/parite", "Mövcud paritələr"),
     ])
-    bot.reply_to(message, "👋 Tradebo v2 (24/7 Cloud Version) aktivdir!")
+    bot.reply_to(message, "👋 **Tradebo v3 (Virtual Wallet & AI Research)** aktivdir!\n\n/balans - Botun xəyali 10,000$ kapitalı və qazanc statistikası")
+
+@bot.message_handler(commands=['balans'])
+def show_balance(message):
+    check_and_update_trades_db()
+    w = get_wallet()
+    win_rate = (w["wins"] / w["total_trades"] * 100) if w["total_trades"] > 0 else 0.0
+    
+    txt = (
+        "🏆 **VİRTUAL PORTFEL VƏ MÜKAFAT MEXANİZMİ**\n\n"
+        f"💵 **Cari Balans:** `{w['balance']:.2f}$`\n"
+        f"📈 **Ümumi PnL (Qazanc/İtki):** `{w['total_profit']:+.2f}$`\n"
+        f"🎯 **Hər Giriş Riski:** `50.00$`\n"
+        f"📊 **Ümumi Əməliyyat:** `{w['total_trades']}`\n"
+        f"🟢 **Qazanılan (TP):** `{w['wins']}`\n"
+        f"🔴 **İtirilən (SL):** `{w['losses']}`\n"
+        f"🔥 **Uğur Nisbəti (Win Rate):** `{win_rate:.1f}%`\n"
+    )
+    bot.reply_to(message, txt, parse_mode="Markdown")
+
+@bot.message_handler(commands=['arastir'])
+def handle_research(message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        bot.reply_to(message, "⚠️ İzləmək istədiyiniz mövzunu yazın. Nümunə: `/arastir FVG Order Block`", parse_mode="Markdown")
+        return
+    topic = args[1]
+    bot.reply_to(message, f"🔎 **{topic}** haqqında internetdə araşdırma aparılır...")
+    res = web_research_smc_concept(topic)
+    bot.reply_to(message, f"🧠 **Yeni strategiya öyrənildi və JSON-a əlavə edildi:**\n\n`{res}`", parse_mode="Markdown")
 
 @bot.message_handler(commands=['parite'])
 def send_parite_guide(message):
@@ -208,19 +391,20 @@ def send_parite_guide(message):
 
 @bot.message_handler(commands=['history'])
 def show_history(message):
-    bot.reply_to(message, "⏳ Açıq əməliyyatların cari vəziyyəti yoxlanılır...")
+    bot.reply_to(message, "⏳ Açıq əməliyyatların vəziyyəti yoxlanılır...")
     check_and_update_trades_db()
     trades = get_trades_db()
     if not trades:
-        bot.reply_to(message, "Hələ heç bir əməliyyat arxivə əlavə edilməyib.")
+        bot.reply_to(message, "Hələ heç bir əməliyyat yoxdur.")
         return
         
     last_10 = trades[::-1][:10]
-    cavab = "📚 **Son 10 Əməliyyat Tarixçəsi (SQLite):**\n\n"
+    cavab = "📚 **Son 10 Əməliyyat və Mükafat Tarixçəsi:**\n\n"
     for t in last_10:
+        pnl_str = f" | PnL: `{t['pnl']:+.2f}$`" if t['status'] != "Açıq" else ""
         cavab += f"ID: `/bilgi {t['id']}` | {t['symbol']} | Saat: {t['saat']}\n"
         cavab += f"Giriş: {t['entry_price']} | SL: {t['sl_price']} | TP: {t['tp_price']}\n"
-        cavab += f"Status: **{t['status']}**\n"
+        cavab += f"Status: **{t['status']}**{pnl_str}\n"
         cavab += "----------\n"
         
     bot.reply_to(message, cavab, parse_mode="Markdown")
@@ -248,13 +432,15 @@ def trade_info(message):
             f"**Giriş:** {tapilan['entry_price']}\n"
             f"**Stop Loss:** {tapilan['sl_price']}\n"
             f"**Take Profit:** {tapilan['tp_price']}\n"
+            f"**Giriş Həcmi:** 50.00$\n"
+            f"**Nəticə PnL:** {tapilan['pnl']:+.2f}$\n"
             f"**Status:** {tapilan['status']}\n\n"
-            f"**Analiz Xülasəsi:**\n{tapilan.get('sebeb', 'Səbəb qeyd olunmayıb')}"
+            f"**Analiz Səbəbi:**\n{tapilan.get('sebeb', 'Səbəb qeyd olunmayıb')}"
         )
         try:
             bot.reply_to(message, mesaj, parse_mode="Markdown")
         except Exception:
-            bot.reply_to(message, mesaj) # Markdown xətası olarsa sadə mətnlə göndər
+            bot.reply_to(message, mesaj)
     else:
         bot.reply_to(message, "❌ Bu ID ilə əməliyyat tapılmadı.")
 
@@ -268,14 +454,14 @@ def analyze_single_market(message):
             
         symbol = mesaj_hisseleri[1].upper()
         check_and_update_trades_db()
-        bot.reply_to(message, f"🕵️‍♂️ {symbol} üçün SMC analizi hazırlanır...")
+        bot.reply_to(message, f"🕵️‍♂️ {symbol} üçün SMC analizi aparılır...")
 
         market_data = get_market_story_multi_tf(symbol)
         ict_bazasi = bazadan_ağıllı_ict_sec("mss choch orderblock liquidity fvg premium discount", max_chunks=30)
         
         trade_id = random.randint(10000, 99999)
 
-        system_prompt = f"""Sən peşəkar SMC trading alqoritmisən. Bütün rəqəmləri dəqiq ver.
+        system_prompt = f"""Sən peşəkar SMC trading alqoritmisən.
 [BİLİKLƏR]
 {ict_bazasi}
 [DATA]
@@ -314,34 +500,27 @@ JSON formatında cavab ver:
                 "tp_price": parsed_data.get("tp_price"),
                 "is_buy": parsed_data.get("is_buy"),
                 "status": "Açıq",
-                "sebeb": parsed_data.get("yekun_institusional_hesabat")
+                "sebeb": parsed_data.get("yekun_institusional_hesabat"),
+                "pnl": 0.0
             }
             save_trade_db(yeni_emeliyyat)
         
-        user_context[message.chat.id] = {
-            "symbol": symbol,
-            "market_data": market_data,
-            "last_analysis": ai_response
-        }
-        
-        # Süni intellektin JSON blokunu Telegram üçün təmizləyirik
         clean_json_text = ai_response.replace("```json", "").replace("```", "").strip()
-        cavab_mesaji = f"📊 **SMC Raportu (ID: `{trade_id}`):**\n```json\n{clean_json_text}\n```"
+        cavab_mesaji = f"📊 **SMC Raportu (ID: `{trade_id}` | Risk: 50$):**\n```json\n{clean_json_text}\n```"
         
         try:
             bot.reply_to(message, cavab_mesaji, parse_mode="Markdown")
         except Exception:
-            # Markdown xətası olarsa sadə mətnlə göndər
             bot.reply_to(message, f"📊 SMC Raportu (ID: {trade_id}):\n\n{clean_json_text}")
         
     except Exception as e:
         bot.reply_to(message, f"Xəta baş verdi: {e}")
 
-# --- AVTONOM ETH TRADER VƏ SELF-LEARNING ---
+# --- AVTONOM ETH TRADER VƏ ÖYRƏNMƏ ---
 def learn_from_trade(trade):
-    prompt = f"""ETH-USD əməliyyatı nəticələndi. Giriş: {trade['entry_price']}, SL: {trade['sl_price']}, TP: {trade['tp_price']}.
-Səbəb: {trade['sebeb']} | Nəticə: {trade['status']}.
-SMC prinsipi ilə 2 cümləlik dərs çıxar."""
+    prompt = f"""ETH-USD əməliyyatı bitti. Giriş: {trade['entry_price']}, SL: {trade['sl_price']}, TP: {trade['tp_price']}.
+Səbəb: {trade['sebeb']} | Nəticə: {trade['status']} | PnL: {trade['pnl']}$.
+SMC prinsipi ilə 2 cümləlik ingiliscə dərs çıxar."""
     try:
         response = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
@@ -362,7 +541,6 @@ def autonomous_eth_trader():
             trades = get_trades_db("AUTO_ETH")
             has_open_trade = any(t["status"] == "Açıq" for t in trades)
             
-            # Dərs çıxarma
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
             for t in trades:
@@ -372,7 +550,6 @@ def autonomous_eth_trader():
             conn.commit()
             conn.close()
 
-            # Yeni əməliyyat yoxlanışı
             if not has_open_trade:
                 market_data = get_market_story_multi_tf(symbol)
                 ict_bazasi = bazadan_ağıllı_ict_sec("mss choch orderblock fvg liquidity", max_chunks=30)
@@ -402,32 +579,28 @@ JSON: {{"id":"{trade_id}", "qerar":"BUY/SELL/HOLD", "tovsiye_statusu":"Tövsiyə
                         "is_buy": parsed_data.get("is_buy"),
                         "status": "Açıq",
                         "sebeb": parsed_data.get("yekun_institusional_hesabat"),
+                        "pnl": 0.0,
                         "ders_cixarildi": False
                     }
                     save_trade_db(yeni_emeliyyat)
-                    print(f"🤖 Auto ETH Trade Açıldı! ID: {trade_id}")
+                    print(f"🤖 Auto ETH Trade Açıldı! ID: {trade_id} (Stake: 50$)")
             
         except Exception as e:
             print(f"Avtonom bot xətası: {e}")
             
-        time.sleep(900) # 15 dəqiqə
+        time.sleep(900)
 
 # --- SİSTEMİN BAŞLADILMASI ---
 if __name__ == "__main__":
-    print("🚀 Tradebo v2 Bulud Sistemi Başladılır...")
+    print("🚀 Tradebo v3 Virtual Wallet & AI Server Başladılır...")
     
-    # 1. SQLite Bazasını Yarat
     init_db()
+    safe_clean_json()
     
-    # 2. Flask Keep-Alive Serverini işə sal
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    print("🌐 Keep-Alive Veb Server Aktivdir.")
     
-    # 3. Auto ETH Trader Başlat
     eth_thread = threading.Thread(target=autonomous_eth_trader, daemon=True)
     eth_thread.start()
-    print("📈 Avtonom ETH alqoritmi işləyir.")
     
-    # 4. Telegram Bot
     bot.infinity_polling()
