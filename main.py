@@ -267,16 +267,34 @@ def append_new_strategy_to_json(new_knowledge):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def web_research_smc_concept(topic):
-    """Google/Araşdırma mənbələrindən istifadə edərək AI vasitəsilə yeni strategiya öyrənir."""
+    """Google/DuckDuckGo və ya AI daxili bilikləri vasitəsilə təhlükəsiz yeni strategiya öyrənir."""
+    search_summary = ""
+    
+    # 1-ci cəhd: duckduckgo_search kitabxanası dənənir
     try:
-        url = f"https://html.duckduckgo.com/html/?q=SMC+trading+{topic.replace(' ', '+')}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        req = requests.get(url, headers=headers, timeout=5)
-        soup = BeautifulSoup(req.text, 'html.parser')
-        results = [a.text for a in soup.find_all('a', class_='result__snippet')[:3]]
-        search_summary = "\n".join(results) if results else "Xüsusi nəticə tapılmadı."
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(f"SMC trading {topic}", max_results=3))
+            for r in results:
+                search_summary += f"- {r.get('title', '')}: {r.get('body', '')}\n"
+    except Exception:
+        # 2-ci cəhd: Əgər duckduckgo_search yoxdursa və ya bloklanarsa HTML scraping dənənir
+        try:
+            url = f"https://html.duckduckgo.com/html/?q=SMC+trading+{topic.replace(' ', '+')}"
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+            req = requests.get(url, headers=headers, timeout=5)
+            soup = BeautifulSoup(req.text, 'html.parser')
+            results = [a.text for a in soup.find_all('a', class_='result__snippet')[:3]]
+            search_summary = "\n".join(results) if results else ""
+        except Exception:
+            search_summary = ""
 
-        prompt = f"""İnternet araşdırmasından SMC ({topic}) haqqında məlumatlar tapıldı:
+    # Əgər internet axtarışı ümumiyyətlə alınmazsa, AI daxili SMC məlumatı ilə əvəzləyir (Fallback)
+    if not search_summary.strip():
+        search_summary = f"SMC (Smart Money Concepts) core principles regarding {topic}"
+
+    try:
+        prompt = f"""İnternet/Daxili araşdırmadan SMC ({topic}) haqqında məlumatlar tapıldı:
 {search_summary}
 Bu məlumatı təhlil et və bota gələcəkdə istifadə etməsi üçün 3 cümləlik İNGİLİS dilində dəqiq SMC qaydası formalaşdır. Yalnız qaydanı qaytar."""
 
@@ -337,16 +355,26 @@ def extract_json(text):
     except:
         return None
 
-# --- TELEGRAM COMMAND HANDLERS ---
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    bot.set_my_commands([
+# --- TELEGRAM MENYU VƏ ƏMR HƏNDLERLƏRİ ---
+def set_bot_commands():
+    """Telegram mesaj yazma hissəsində / yazdıda bütün əmrlərin avtomatik görünməsi üçün."""
+    commands = [
         telebot.types.BotCommand("/analiz", "Paritə analizi et ($50 risk)"),
         telebot.types.BotCommand("/balans", "Virtual portfel və mükafatlar"),
         telebot.types.BotCommand("/history", "Son əməliyyat tarixçəsi"),
+        telebot.types.BotCommand("/bilgi", "Əməliyyat detalını göstər (ID ilə)"),
         telebot.types.BotCommand("/arastir", "SMC konsepsiyası araşdır"),
-        telebot.types.BotCommand("/parite", "Mövcud paritələr"),
-    ])
+        telebot.types.BotCommand("/parite", "Mövcud paritələr siyahısı"),
+        telebot.types.BotCommand("/start", "Bota yenidən başla / Menyu")
+    ]
+    try:
+        bot.set_my_commands(commands)
+    except Exception as e:
+        print(f"Komandalar menyuya əlavə edilərkən xəta: {e}")
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    set_bot_commands()
     bot.reply_to(message, "👋 **Tradebo v3 (Virtual Wallet & AI Research)** aktivdir!\n\n/balans - Botun xəyali 10,000$ kapitalı və qazanc statistikası")
 
 @bot.message_handler(commands=['balans'])
@@ -596,6 +624,7 @@ if __name__ == "__main__":
     
     init_db()
     safe_clean_json()
+    set_bot_commands()  # Bot açılan kimi / düymələrini Telegram menyusuna göndərir
     
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
