@@ -8,7 +8,7 @@ import datetime
 import threading
 import time
 import re
-import sqlite3
+import psycopg2
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask
@@ -16,12 +16,12 @@ from flask import Flask
 # --- KONFİQURASİYA VƏ ƏTRAF DƏYİŞƏNLƏRİ (ENV) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Render-dən gələn PostgreSQL URL-i
 
 bot = telebot.TeleBot(BOT_TOKEN)
 client = Groq(api_key=GROQ_API_KEY)
 
 BAZA_FAYLI = "ict_knowledge.json"
-DB_FILE = "tradebo.db"
 LESSONS_FILE = "lessons_learned.txt"
 INITIAL_BALANCE = 10000.0  # Xəyali İlkin Balans ($)
 TRADE_STAKE = 50.0         # Hər əməliyyata sabit daxil olunan məbləğ ($)
@@ -40,9 +40,12 @@ def run_flask():
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
 
-# --- SQLITE VERİLƏNLƏR BAZASI VƏ BALANS İDARƏSİ ---
+# --- POSTGRESQL VERİLƏNLƏR BAZASI VƏ BALANS İDARƏSİ ---
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     # Əməliyyatlar Cədvəli
     cursor.execute('''
@@ -77,14 +80,14 @@ def init_db():
     if cursor.fetchone()[0] == 0:
         cursor.execute('''
             INSERT INTO wallet (id, balance, total_profit, total_trades, wins, losses)
-            VALUES (1, ?, 0.0, 0, 0, 0)
+            VALUES (1, %s, 0.0, 0, 0, 0)
         ''', (INITIAL_BALANCE,))
         
     conn.commit()
     conn.close()
 
 def get_wallet():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT balance, total_profit, total_trades, wins, losses FROM wallet WHERE id=1")
     row = cursor.fetchone()
@@ -100,7 +103,7 @@ def get_wallet():
     return {"balance": INITIAL_BALANCE, "total_profit": 0.0, "total_trades": 0, "wins": 0, "losses": 0}
 
 def update_wallet_on_trade_close(pnl):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     wallet = get_wallet()
     
@@ -112,7 +115,7 @@ def update_wallet_on_trade_close(pnl):
     
     cursor.execute('''
         UPDATE wallet 
-        SET balance=?, total_profit=?, total_trades=?, wins=?, losses=?
+        SET balance=%s, total_profit=%s, total_trades=%s, wins=%s, losses=%s
         WHERE id=1
     ''', (new_balance, new_profit, new_trades, new_wins, new_losses))
     
@@ -120,12 +123,14 @@ def update_wallet_on_trade_close(pnl):
     conn.close()
 
 def save_trade_db(trade_data):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT OR REPLACE INTO trades 
+        INSERT INTO trades 
         (id, symbol, trade_type, saat, entry_price, sl_price, tp_price, is_buy, status, sebeb, pnl, ders_cixarildi)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET 
+        status=EXCLUDED.status, pnl=EXCLUDED.pnl, ders_cixarildi=EXCLUDED.ders_cixarildi
     ''', (
         str(trade_data["id"]),
         trade_data["symbol"],
@@ -144,10 +149,10 @@ def save_trade_db(trade_data):
     conn.close()
 
 def get_trades_db(trade_type=None):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     if trade_type:
-        cursor.execute("SELECT * FROM trades WHERE trade_type=?", (trade_type,))
+        cursor.execute("SELECT * FROM trades WHERE trade_type=%s", (trade_type,))
     else:
         cursor.execute("SELECT * FROM trades")
     rows = cursor.fetchall()
@@ -174,7 +179,7 @@ def get_trades_db(trade_type=None):
 # --- PIPS VƏ MÜKAFAT KALKULYATORU ---
 def check_and_update_trades_db():
     trades = get_trades_db()
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     for t in trades:
@@ -215,7 +220,7 @@ def check_and_update_trades_db():
                         pnl = TRADE_STAKE * ratio
                         
                 if new_status:
-                    cursor.execute("UPDATE trades SET status=?, pnl=? WHERE id=?", (new_status, round(pnl, 2), t["id"]))
+                    cursor.execute("UPDATE trades SET status=%s, pnl=%s WHERE id=%s", (new_status, round(pnl, 2), t["id"]))
                     update_wallet_on_trade_close(round(pnl, 2))
             except Exception as e:
                 print(f"Qiymət yeniləmə xətası: {e}")
@@ -226,7 +231,6 @@ def check_and_update_trades_db():
 
 # --- JSON BAZASI İDARƏSİ VƏ ARAŞDIRMA SİSTEMİ ---
 def safe_clean_json():
-    """Strategiyaları silmədən json faylı təmizləyir va lazımsız dublikat/boş mətnləri kənarlaşdırır."""
     if not os.path.exists(BAZA_FAYLI):
         return
     with open(BAZA_FAYLI, "r", encoding="utf-8") as f:
@@ -239,7 +243,6 @@ def safe_clean_json():
     seen = set()
     for item in data:
         text = item.strip()
-        # English studies və ya lazımsız akademik mətnləri süzgəcdən keçir
         if "English Studies" in text or "ISSN " in text or "Bulgarian University" in text:
             continue
         if len(text) > 30 and text not in seen:
@@ -250,7 +253,6 @@ def safe_clean_json():
         json.dump(clean_data, f, ensure_ascii=False, indent=2)
 
 def append_new_strategy_to_json(new_knowledge):
-    """Əsas strategiyanı silmədən internetdən öyrənilən yeni konsepsiyanı JSON-a əlavə edir."""
     safe_clean_json()
     if not os.path.exists(BAZA_FAYLI):
         data = []
@@ -268,10 +270,8 @@ def append_new_strategy_to_json(new_knowledge):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def web_research_smc_concept(topic):
-    """Google/DuckDuckGo və ya AI daxili bilikləri vasitəsilə ətraflı VƏ DƏRİN TEXNİKİ SMC strategiyası öyrənir."""
     search_summary = ""
     
-    # 1-ci cəhd: duckduckgo_search (Nəticə sayını 3-dən 6-ya qaldırırıq ki, daha çox texniki mənbə toplansın)
     try:
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
@@ -279,7 +279,6 @@ def web_research_smc_concept(topic):
             for r in results:
                 search_summary += f"- {r.get('title', '')}: {r.get('body', '')}\n"
     except Exception:
-        # 2-ci cəhd: HTML scraping (5 nəticə götürürük)
         try:
             url = f"https://html.duckduckgo.com/html/?q=SMC+trading+technical+{topic.replace(' ', '+')}"
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -290,12 +289,10 @@ def web_research_smc_concept(topic):
         except Exception:
             search_summary = ""
 
-    # Fallback
     if not search_summary.strip():
         search_summary = f"Detailed SMC (Smart Money Concepts) mechanics, liquidity sweeps, and technical market structure for {topic}"
 
     try:
-        # 3 cümlə limiti silindi və dərin texniki tələblər (Entry, Invalidation, Structure) əlavə olundu
         prompt = f"""İnternet/Daxili araşdırmadan SMC ({topic}) haqqında məlumatlar tapıldı:
 {search_summary}
 
@@ -367,7 +364,6 @@ def extract_json(text):
 
 # --- TELEGRAM MENYU VƏ ƏMR HƏNDLERLƏRİ ---
 def set_bot_commands():
-    """Telegram mesaj yazma hissəsində / yazdıda bütün əmrlərin avtomatik görünməsi üçün."""
     commands = [
         telebot.types.BotCommand("/analiz", "Paritə analizi et ($50 risk)"),
         telebot.types.BotCommand("/balans", "Virtual portfel və mükafatlar"),
@@ -579,12 +575,12 @@ def autonomous_eth_trader():
             trades = get_trades_db("AUTO_ETH")
             has_open_trade = any(t["status"] == "Açıq" for t in trades)
             
-            conn = sqlite3.connect(DB_FILE)
+            conn = get_db_connection()
             cursor = conn.cursor()
             for t in trades:
                 if t["status"] in ["🔴 SL Oldu", "🟢 TP Oldu"] and not t["ders_cixarildi"]:
                     learn_from_trade(t)
-                    cursor.execute("UPDATE trades SET ders_cixarildi=1 WHERE id=?", (t["id"],))
+                    cursor.execute("UPDATE trades SET ders_cixarildi=1 WHERE id=%s", (t["id"],))
             conn.commit()
             conn.close()
 
