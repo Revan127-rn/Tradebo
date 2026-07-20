@@ -318,7 +318,7 @@ Heç bir cümlə və ya uzunluq məhdudiyyəti qoyma. Bütün vacib texniki para
     except Exception as e:
         return f"Araşdırma zamanı xəta: {e}"
 
-def bazadan_ağıllı_ict_sec(axtaris_sozleri, max_chunks=30):
+def bazadan_ağıllı_ict_sec(axtaris_sozleri, max_chunks=70):
     safe_clean_json()
     if not os.path.exists(BAZA_FAYLI):
         return "Qeyd: Hələ heç bir strategiya öyrənilməyib."
