@@ -267,36 +267,45 @@ def append_new_strategy_to_json(new_knowledge):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def web_research_smc_concept(topic):
-    """Google/DuckDuckGo və ya AI daxili bilikləri vasitəsilə təhlükəsiz yeni strategiya öyrənir."""
+    """Google/DuckDuckGo və ya AI daxili bilikləri vasitəsilə ətraflı VƏ DƏRİN TEXNİKİ SMC strategiyası öyrənir."""
     search_summary = ""
     
-    # 1-ci cəhd: duckduckgo_search kitabxanası dənənir
+    # 1-ci cəhd: duckduckgo_search (Nəticə sayını 3-dən 6-ya qaldırırıq ki, daha çox texniki mənbə toplansın)
     try:
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
-            results = list(ddgs.text(f"SMC trading {topic}", max_results=3))
+            results = list(ddgs.text(f"SMC trading technical guide breakdown {topic}", max_results=6))
             for r in results:
                 search_summary += f"- {r.get('title', '')}: {r.get('body', '')}\n"
     except Exception:
-        # 2-ci cəhd: Əgər duckduckgo_search yoxdursa və ya bloklanarsa HTML scraping dənənir
+        # 2-ci cəhd: HTML scraping (5 nəticə götürürük)
         try:
-            url = f"https://html.duckduckgo.com/html/?q=SMC+trading+{topic.replace(' ', '+')}"
+            url = f"https://html.duckduckgo.com/html/?q=SMC+trading+technical+{topic.replace(' ', '+')}"
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
             req = requests.get(url, headers=headers, timeout=5)
             soup = BeautifulSoup(req.text, 'html.parser')
-            results = [a.text for a in soup.find_all('a', class_='result__snippet')[:3]]
+            results = [a.text for a in soup.find_all('a', class_='result__snippet')[:5]]
             search_summary = "\n".join(results) if results else ""
         except Exception:
             search_summary = ""
 
-    # Əgər internet axtarışı ümumiyyətlə alınmazsa, AI daxili SMC məlumatı ilə əvəzləyir (Fallback)
+    # Fallback
     if not search_summary.strip():
-        search_summary = f"SMC (Smart Money Concepts) core principles regarding {topic}"
+        search_summary = f"Detailed SMC (Smart Money Concepts) mechanics, liquidity sweeps, and technical market structure for {topic}"
 
     try:
+        # 3 cümlə limiti silindi və dərin texniki tələblər (Entry, Invalidation, Structure) əlavə olundu
         prompt = f"""İnternet/Daxili araşdırmadan SMC ({topic}) haqqında məlumatlar tapıldı:
 {search_summary}
-Bu məlumatı təhlil et və bota gələcəkdə istifadə etməsi üçün 3 cümləlik İNGİLİS dilində dəqiq SMC qaydası formalaşdır. Yalnız qaydanı qaytar."""
+
+Bu məlumatı təhlil et və bota gələcəkdə ticarət analizi edərkən istifadə etməsi üçün İNGİLİS dilində DƏQİQ VƏ DƏRİN TEXNİKİ SMC QAYDALARI (Detailed Technical Execution Rules) hazırla.
+
+Qaydalar aşağıdakı texniki detalları tam əhatə etməlidir:
+1. Market Structure & Identification (HTF/LTF alignment, Inducement, Premium/Discount zones, Liquidity Sweeps)
+2. Entry Refinement & Trigger Criteria (Order Block, FVG validation, MSS/CHOCH confirmation)
+3. Invalidation & Risk Rules (Stop Loss placement, Structural Failure points)
+
+Heç bir cümlə və ya uzunluq məhdudiyyəti qoyma. Bütün vacib texniki parametrləri ətraflı şəkildə yaz. Yalnız qayda və şərtləri qaytar."""
 
         res = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
