@@ -249,9 +249,12 @@ def trade_info(message):
             f"**Stop Loss:** {tapilan['sl_price']}\n"
             f"**Take Profit:** {tapilan['tp_price']}\n"
             f"**Status:** {tapilan['status']}\n\n"
-            f"**Analiz Xülasəsi:**\n_{tapilan.get('sebeb', 'Səbəb qeyd olunmayıb')}_"
+            f"**Analiz Xülasəsi:**\n{tapilan.get('sebeb', 'Səbəb qeyd olunmayıb')}"
         )
-        bot.reply_to(message, mesaj, parse_mode="Markdown")
+        try:
+            bot.reply_to(message, mesaj, parse_mode="Markdown")
+        except Exception:
+            bot.reply_to(message, mesaj) # Markdown xətası olarsa sadə mətnlə göndər
     else:
         bot.reply_to(message, "❌ Bu ID ilə əməliyyat tapılmadı.")
 
@@ -321,7 +324,15 @@ JSON formatında cavab ver:
             "last_analysis": ai_response
         }
         
-        bot.reply_to(message, f"📊 **SMC Raportu (ID: `{trade_id}`):**\n```json\n{ai_response}\n```", parse_mode="Markdown")
+        # Süni intellektin JSON blokunu Telegram üçün təmizləyirik
+        clean_json_text = ai_response.replace("```json", "").replace("```", "").strip()
+        cavab_mesaji = f"📊 **SMC Raportu (ID: `{trade_id}`):**\n```json\n{clean_json_text}\n```"
+        
+        try:
+            bot.reply_to(message, cavab_mesaji, parse_mode="Markdown")
+        except Exception:
+            # Markdown xətası olarsa sadə mətnlə göndər
+            bot.reply_to(message, f"📊 SMC Raportu (ID: {trade_id}):\n\n{clean_json_text}")
         
     except Exception as e:
         bot.reply_to(message, f"Xəta baş verdi: {e}")
