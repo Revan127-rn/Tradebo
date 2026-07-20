@@ -12,8 +12,9 @@ import sqlite3
 from flask import Flask
 
 # --- KONFİQURASİYA VƏ ƏTRAF DƏYİŞƏNLƏRİ (ENV) ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8978234619:AAESHecZK0EXt2mnCCkQI64AYWsJEJnZFbY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
 
 bot = telebot.TeleBot(BOT_TOKEN)
 client = Groq(api_key=GROQ_API_KEY)
