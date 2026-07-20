@@ -1,10 +1,4 @@
-google-generativeai
-langchain
-langchain-community
-chromadb
-pypdf
-youtube-transcript-api
-ccxt
-python-dotenv
-sentence-transformers
 pyTelegramBotAPI
+groq
+yfinance
+flask
