@@ -36,8 +36,9 @@ def home():
     return "🚀 Tradebo v3 Virtual Wallet & AI Research Server Aktivdir!"
 
 def run_flask():
+    # Render avtomatik PORT təyin edir, yoxdursa 8080 götürür
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
 
 # --- SQLITE VERİLƏNLƏR BAZASI VƏ BALANS İDARƏSİ ---
 def init_db():
